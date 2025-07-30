@@ -8,6 +8,8 @@ from langgraph.types import Command, interrupt
 import json
 
 
+
+
 class SearchResult(BaseModel):
     title: str
     content: str

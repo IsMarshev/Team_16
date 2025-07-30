@@ -71,6 +71,8 @@ class RoleAgent:
             response = chain.invoke({"messages": messages})
         else:
             response = self.chain.invoke({"messages": messages})
+
+        print(response)
         
         return {
             "messages": messages + [response],
