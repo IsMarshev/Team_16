@@ -1,4 +1,4 @@
-from src.agents import SearchAgent,EnhancedWebSearchAgent
+from src.agents import SearchAgent
 from src.config import Config
 import os
 from dotenv import load_dotenv

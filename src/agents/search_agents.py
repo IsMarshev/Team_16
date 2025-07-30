@@ -1,17 +1,11 @@
+from typing import List, Dict, Any, Optional
+from typing_extensions import TypedDict
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
 from langchain_tavily import TavilySearch
-from langgraph.prebuilt import create_react_agent
-from typing import List, Dict, Any
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents import create_react_agent, AgentExecutor
-from langchain.tools import Tool
 from pydantic import BaseModel, Field
-from langchain_tavily import TavilySearch
-from langgraph.prebuilt import create_react_agent
+from langgraph.types import Command, interrupt
 import json
-from langchain.output_parsers import PydanticOutputParser
 
 
 class SearchResult(BaseModel):
@@ -21,28 +15,103 @@ class SearchResult(BaseModel):
     relevance_score: float = 0.0
     relevance_reasoning: str = ""
 
+
 class RelevanceEvaluation(BaseModel):
     relevance_score: float = Field(ge=0, le=10, description="Relevance score from 0 to 10")
     reasoning: str = Field(description="Brief explanation of the relevance score")
 
-class SearchAgent:
 
+class SearchAgentState(TypedDict):
+    """Состояние для SearchAgent в графе"""
+    search_query: Optional[str]
+    search_results: Optional[List[SearchResult]]
+    formatted_results: Optional[str]
+    context: Optional[Dict[str, Any]]
+
+
+class SearchAgent:
+    """Поисковый агент для использования в LangGraph"""
+    
     def __init__(self, config):
         self._llm = ChatOpenAI(
-                api_key=config.api_key.get_secret_value(),
-                base_url=config.url,
-                model=config.websearch.model_name,
-                temperature=config.websearch.temperature,
-                model_kwargs={"max_tokens": config.websearch.max_tokens},
-                extra_body={"use_beam_search": config.websearch.use_beam_search, "best_of": config.websearch.best_of}
-            )
+            api_key=config.api_key.get_secret_value(),
+            base_url=config.url,
+            model=config.websearch.model_name,
+            temperature=config.websearch.temperature,
+            model_kwargs={"max_tokens": config.websearch.max_tokens},
+            extra_body={
+                "use_beam_search": config.websearch.use_beam_search, 
+                "best_of": config.websearch.best_of
+            }
+        )
         
         self._search_tool = TavilySearch(max_results=5, topic='general')
-        
-    #     self.agent = self._init_agent()
+        self.config = config
+    
 
-    # def _init_agent(self):
-    #     return create_react_agent(self._llm, [self._search_with_rerank])
+
+    def __call__(self, state: SearchAgentState) -> SearchAgentState:
+        """Основной метод для вызова агента как узла графа"""
+        # Извлекаем поисковый запрос из последнего сообщения или из состояния
+        search_query = state.get("search_query")
+    
+        
+        if not search_query:
+            # Если запрос не найден, возвращаем состояние с сообщением об ошибке
+            error_message = AIMessage(
+                content="Не удалось определить поисковый запрос. Пожалуйста, укажите, что нужно найти."
+            )
+            return {
+                "search_results": state["search_results"] + [error_message],
+                "formatted_results": None
+            }
+        
+        # Выполняем поиск
+        top_k = state.get("context", {}).get("top_k", 10)
+        search_results, formatted_results = self._perform_search(search_query, top_k)
+        
+        # Создаем ответное сообщение
+        response_message = AIMessage(
+            content=f"Результаты поиска по запросу '{search_query}':\n\n{formatted_results}"
+        )
+        
+        # Обновляем состояние
+        return {
+            "search_query": state["search_results"] + [response_message],
+            "search_results": search_results,
+            "formatted_results": formatted_results
+        }
+    
+    def _extract_search_query(self, message_content: str) -> str:
+        """Извлекает поисковый запрос из сообщения пользователя"""
+        # Простая эвристика - можно заменить на более сложную логику или LLM
+        keywords = ["найди", "поищи", "search", "find", "искать", "информация о", "что такое"]
+        
+        content_lower = message_content.lower()
+        for keyword in keywords:
+            if keyword in content_lower:
+                # Извлекаем часть после ключевого слова
+                parts = content_lower.split(keyword, 1)
+                if len(parts) > 1:
+                    return parts[1].strip()
+        
+        # Если ключевые слова не найдены, используем все сообщение как запрос
+        return message_content
+    
+    def _perform_search(self, query: str, top_k: int = 10) -> tuple[List[SearchResult], str]:
+        """Выполняет поиск и реранжирование"""
+        raw_result = self._search_tool.invoke(query)
+        reranked_results = self._rerank_results(raw_result['results'], query)
+        
+        relevant_results = [r for r in reranked_results if r.relevance_score >= 5.0]
+        
+        if not relevant_results:
+            results_to_return = reranked_results[:top_k]
+        else:
+            results_to_return = relevant_results[:top_k]
+        
+        formatted = self._format_results(results_to_return)
+        return results_to_return, formatted
     
     def _rerank_results(self, results: List[Dict], query: str) -> List[SearchResult]:
         """Реранжирует результаты поиска на основе релевантности"""
@@ -73,9 +142,10 @@ class SearchAgent:
             
             structured_llm = self._llm.with_structured_output(RelevanceEvaluation)
             evaluation = structured_llm.invoke([
-                    SystemMessage(content="You are a relevance evaluator. Analyze the content and return structured output."),
-                    HumanMessage(content=prompt)
-                ])
+                SystemMessage(content="You are a relevance evaluator. Analyze the content and return structured output."),
+                HumanMessage(content=prompt)
+            ])
+            
             try:
                 search_result = SearchResult(
                     title=result['title'],
@@ -86,7 +156,8 @@ class SearchAgent:
                 )
                 reranked_results.append(search_result)
             except Exception as e:
-                raise Exception(e)
+                print(f"Error processing result: {e}")
+                continue
         
         reranked_results.sort(key=lambda x: x.relevance_score, reverse=True)
         
@@ -94,6 +165,9 @@ class SearchAgent:
     
     def _format_results(self, results: List[SearchResult]) -> str:
         """Форматирует результаты для вывода"""
+        if not results:
+            return "Релевантные результаты не найдены."
+        
         formatted = []
         for i, result in enumerate(results, 1):
             formatted.append(
@@ -104,18 +178,3 @@ class SearchAgent:
                 f"   URL: {result.url}\n"
             )
         return "\n".join(formatted)
-    
-
-    def search_with_rerank(self, query: str, top_k: int = 10):
-        """Выполняет поиск и реранжирование результатов"""
-        raw_result = self._search_tool.invoke(query)
-        reranked_results = self._rerank_results(raw_result['results'], query)
-
-        relevant_results = [r for r in reranked_results if r.relevance_score >= 5.0]
-
-        if not reranked_results:
-            return self._format_results(reranked_results[:top_k])
-        return self._format_results(relevant_results[:top_k])
-    
-
-    
