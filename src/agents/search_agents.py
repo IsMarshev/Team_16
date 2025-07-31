@@ -69,7 +69,7 @@ class SearchAgent:
             }
         
         # Выполняем поиск
-        top_k = state.get("context", {}).get("top_k", 10)
+        top_k = state.get("context", {}).get("top_k", 8)
         search_results, formatted_results = self._perform_search(search_query, top_k)
         
         # Создаем ответное сообщение
